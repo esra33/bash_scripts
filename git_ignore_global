@@ -1,0 +1,10 @@
+*~
+.DS_Store
+*SnowmanGame/Assets/Plugins/Editor.meta
+*GitIgnore*
+*.idea*
+*.aiassistant*
+mono_crash.*.json
+*CLAUDE*
+*GitIgnored*
+*.junie*
