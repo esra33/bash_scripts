@@ -1,21 +1,28 @@
-alias bash_profile="vi ~/.bash_profile;source ~/.bash_profile;RefreshScripts;"
+alias bash_profile="vi ~/.bash_profile; source ~/.bash_profile"
 
-export BASH_SCRIPTS='/Users/andresramirex/Desktop/BashScripts'
-export BREW='/opt/homebrew/bin'
+export BASH_SCRIPTS="$HOME/Documents/Projects/bash_scripts"
+
+# Homebrew first, so tools it installs (pyenv) are on PATH
+eval "$(/opt/homebrew/bin/brew shellenv)"
 
 # Setup Python
-export PYENV_ROOT="$HOME/.pyenv"
-export PATH="$PYENV_ROOT/bin:$PATH"
-eval "$(pyenv init --path)"
-eval "$(pyenv init -)"
-eval "$(pyenv virtualenv-init -)"
+if command -v pyenv >/dev/null; then
+     export PYENV_ROOT="$HOME/.pyenv"
+     eval "$(pyenv init --path)"
+     eval "$(pyenv init -)"
+     eval "$(pyenv virtualenv-init -)"
+fi
 #-------------
 
-export PATH=$PATH:$BASH_SCRIPTS:$BREW
+# Unity CLI
+[ -f "$HOME/.unity/env" ] && . "$HOME/.unity/env"
 
 function RefreshScripts(){
-source $BASH_SCRIPTS/GitCommands.sh
-source $BASH_SCRIPTS/LogCommits.sh
-source $BASH_SCRIPTS/AndroidUtilities.sh
+     source "$BASH_SCRIPTS/GitCommands.sh"
+     source "$BASH_SCRIPTS/LogCommits.sh"
+     source "$BASH_SCRIPTS/AndroidUtilities.sh"
 }
-eval "$(/opt/homebrew/bin/brew shellenv)"
+RefreshScripts
+
+AddToPath "$BASH_SCRIPTS"
+DedupePath
