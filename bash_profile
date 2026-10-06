@@ -21,6 +21,7 @@ function RefreshScripts(){
      source "$BASH_SCRIPTS/GitCommands.sh"
      source "$BASH_SCRIPTS/LogCommits.sh"
      source "$BASH_SCRIPTS/AndroidUtilities.sh"
+     source "$BASH_SCRIPTS/WindowLayouts.sh"
 }
 RefreshScripts
 
