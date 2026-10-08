@@ -2,7 +2,9 @@
 // Compiled on demand by WindowLayouts.sh. Needs Accessibility permission for the terminal app.
 //
 //   WindowLayoutHelper save                      prints the current layout as JSON
-//   WindowLayoutHelper apply <file> [--dry-run] [--launch]
+//   WindowLayoutHelper apply <file> [--dry-run] [--launch] [--move-desktops]
+//   WindowLayoutHelper desktops                  lists desktops and their "Switch to Desktop N" shortcuts
+//   WindowLayoutHelper switch <n>                shows Desktop n using its shortcut
 //   WindowLayoutHelper check                     verifies (and prompts for) Accessibility access
 
 import AppKit
@@ -369,6 +371,178 @@ func resolveDisplay(_ uuid: String?, profile: Profile, displays: [LiveDisplay]) 
 	return displays.first(where: { $0.isMain }) ?? displays.first
 }
 
+//-------------------------------------------------------
+// Moving windows between desktops without yabai. Accessibility can still move a window onto another
+// display, where it lands on the desktop that display is showing, and the "Switch to Desktop N"
+// shortcuts pick which desktop that is. A move within one display bounces off a second display.
+// (Holding the title bar while switching desktops, Amethyst's trick, does not work with synthetic
+// mouse events on macOS 26.)
+
+struct Desktop {
+	let spaceId: UInt64
+	let display: String
+	let number: Int            // 1-based on its display
+	let globalNumber: Int      // 1-based across all displays, as used by "Switch to Desktop N"
+}
+
+struct Hotkey {
+	let keyCode: CGKeyCode
+	let flags: CGEventFlags
+}
+
+// Desktops in Mission Control order, plus the space currently visible on each display.
+func desktopList() -> (desktops: [Desktop], current: [String: UInt64]) {
+	var desktops = [Desktop]()
+	var current = [String: UInt64]()
+	guard let managed = CGSCopyManagedDisplaySpaces(CGSMainConnectionID())?.takeRetainedValue() as? [[String: Any]] else {
+		return (desktops, current)
+	}
+	let displays = liveDisplays()
+	let mainUUID = displays.first(where: { $0.isMain })?.uuid ?? "Main"
+	for entry in managed {
+		var uuid = entry["Display Identifier"] as? String ?? "Main"
+		if uuid == "Main" { uuid = mainUUID }
+		if let id = ((entry["Current Space"] as? [String: Any])?["ManagedSpaceID"] as? NSNumber)?.uint64Value {
+			current[uuid] = id
+		}
+		var number = 0
+		for space in entry["Spaces"] as? [[String: Any]] ?? [] where (space["type"] as? NSNumber)?.intValue != 4 {
+			guard let id = (space["ManagedSpaceID"] as? NSNumber)?.uint64Value else { continue }
+			number += 1
+			desktops.append(Desktop(spaceId: id, display: uuid, number: number, globalNumber: desktops.count + 1))
+		}
+	}
+	return (desktops, current)
+}
+
+// Enabled "Switch to Desktop N" shortcuts (System Settings > Keyboard > Keyboard Shortcuts > Mission Control),
+// keyed by N. They are symbolic hot keys 118 (Desktop 1) through 133 (Desktop 16).
+func desktopHotkeys() -> [Int: Hotkey] {
+	let domain = "com.apple.symbolichotkeys" as CFString
+	CFPreferencesAppSynchronize(domain)
+	guard let all = CFPreferencesCopyAppValue("AppleSymbolicHotKeys" as CFString, domain) as? [String: Any] else { return [:] }
+	var result = [Int: Hotkey]()
+	for n in 1...16 {
+		guard let entry = all[String(117 + n)] as? [String: Any],
+		      (entry["enabled"] as? NSNumber)?.boolValue == true,
+		      let params = (entry["value"] as? [String: Any])?["parameters"] as? [NSNumber], params.count == 3 else { continue }
+		// The modifier mask uses the same bits as CGEventFlags.
+		result[n] = Hotkey(keyCode: CGKeyCode(params[1].intValue), flags: CGEventFlags(rawValue: params[2].uint64Value))
+	}
+	return result
+}
+
+func currentSpace(on display: String) -> UInt64? {
+	desktopList().current[display]
+}
+
+func waitForSpace(_ spaceId: UInt64, on display: String, timeout: TimeInterval = 2) -> Bool {
+	let deadline = Date().addingTimeInterval(timeout)
+	while Date() < deadline {
+		if currentSpace(on: display) == spaceId {
+			Thread.sleep(forTimeInterval: 0.4)   // let the slide animation finish
+			return true
+		}
+		Thread.sleep(forTimeInterval: 0.05)
+	}
+	return false
+}
+
+func press(_ hotkey: Hotkey) {
+	let source = CGEventSource(stateID: .hidSystemState)
+	for keyDown in [true, false] {
+		let event = CGEvent(keyboardEventSource: source, virtualKey: hotkey.keyCode, keyDown: keyDown)
+		event?.flags = hotkey.flags
+		event?.post(tap: .cghidEventTap)
+	}
+}
+
+// Shows a desktop on its display. Succeeds right away if it is already showing.
+func switchTo(_ desktop: Desktop, hotkeys: [Int: Hotkey]) -> Bool {
+	if currentSpace(on: desktop.display) == desktop.spaceId { return true }
+	guard let hotkey = hotkeys[desktop.globalNumber] else { return false }
+	press(hotkey)
+	return waitForSpace(desktop.spaceId, on: desktop.display)
+}
+
+// A frame for parking a window on another display while its own display switches desktops.
+func parkingFrame(_ frame: CGRect, on display: LiveDisplay) -> CGRect {
+	let size = CGSize(width: min(frame.width, display.frame.width), height: min(frame.height, display.frame.height))
+	return CGRect(origin: CGPoint(x: display.frame.midX - size.width / 2, y: display.frame.midY - size.height / 2), size: size)
+}
+
+struct DesktopMove {
+	let label: String
+	let live: LiveWindow
+	let target: Desktop
+	let frame: CGRect
+	let minimize: Bool
+	let where_: String
+}
+
+// Moves each window to its saved desktop. Returns the ones that could not be moved, with the reason.
+func moveAcrossDesktops(_ moves: [DesktopMove]) -> [String] {
+	let hotkeys = desktopHotkeys()
+	let (desktops, startSpaces) = desktopList()
+	let displays = liveDisplays()
+	var failed = [String]()
+
+	for move in moves {
+		guard let id = move.live.id else { failed.append("\(move.label) (no window id)"); continue }
+		let onTarget = { spaceIds(for: id).contains(move.target.spaceId) }
+		guard hotkeys[move.target.globalNumber] != nil else {
+			failed.append("\(move.label) (no shortcut for Desktop \(move.target.globalNumber))")
+			continue
+		}
+		// A window on a desktop that is not showing cannot be moved, so show it first.
+		guard let source = desktops.first(where: { spaceIds(for: id).contains($0.spaceId) }),
+		      switchTo(source, hotkeys: hotkeys) else {
+			failed.append("\(move.label) (could not show its current desktop)")
+			continue
+		}
+		if source.display == move.target.display {
+			guard let parking = displays.first(where: { $0.uuid != move.target.display }) else {
+				failed.append("\(move.label) (moving within a display needs a second display)")
+				continue
+			}
+			axSetFrame(move.live.element, parkingFrame(move.frame, on: parking))
+			Thread.sleep(forTimeInterval: 0.2)
+		}
+		guard switchTo(move.target, hotkeys: hotkeys) else {
+			failed.append("\(move.label) (Desktop \(move.target.globalNumber) did not come up)")
+			continue
+		}
+		axSetFrame(move.live.element, move.frame)
+		Thread.sleep(forTimeInterval: 0.2)
+
+		if onTarget() {
+			if move.minimize { axSetBool(move.live.element, kAXMinimizedAttribute, true) }
+			print("  moved     \(move.label) -> \(move.where_)")
+		} else {
+			failed.append("\(move.label) (did not land on \(move.where_))")
+		}
+	}
+
+	// Put every display back on the desktop it was showing.
+	for (display, spaceId) in startSpaces {
+		if let desktop = desktops.first(where: { $0.spaceId == spaceId && $0.display == display }) {
+			_ = switchTo(desktop, hotkeys: hotkeys)
+		}
+	}
+	return failed
+}
+
+func printDesktops() {
+	let hotkeys = desktopHotkeys()
+	let (desktops, current) = desktopList()
+	let names = Dictionary(liveDisplays().map { ($0.uuid, $0.name) }, uniquingKeysWith: { a, _ in a })
+	for desktop in desktops {
+		let shortcut = hotkeys[desktop.globalNumber] == nil ? "no shortcut" : "shortcut on"
+		let showing = current[desktop.display] == desktop.spaceId ? "  (showing)" : ""
+		print("Desktop \(desktop.globalNumber): \(names[desktop.display] ?? desktop.display) desktop \(desktop.number), \(shortcut)\(showing)")
+	}
+}
+
 func yabaiPath() -> String? {
 	for path in ["/opt/homebrew/bin/yabai", "/usr/local/bin/yabai"] where FileManager.default.isExecutableFile(atPath: path) {
 		return path
@@ -418,7 +592,7 @@ func launchMissingApps(_ profile: Profile) {
 	Thread.sleep(forTimeInterval: 2)
 }
 
-func apply(path: String, dryRun: Bool, launch: Bool) {
+func apply(path: String, dryRun: Bool, launch: Bool, moveDesktops: Bool) {
 	guard let data = FileManager.default.contents(atPath: path) else { fail("Cannot read \(path)") }
 	let profile: Profile
 	do { profile = try JSONDecoder().decode(Profile.self, from: data) } catch { fail("Invalid layout file: \(error)") }
@@ -430,6 +604,8 @@ func apply(path: String, dryRun: Bool, launch: Bool) {
 	let yabai = yabaiPath()
 	var moved = 0, skipped = 0
 	var wrongDesktop = [String]()
+	var desktopMoves = [DesktopMove]()
+	let desktops = desktopList().desktops
 
 	for (saved, live) in match(saved: profile.windows, live: liveWindows()) {
 		let label = "\(saved.app) - \(saved.title.isEmpty ? "(untitled)" : saved.title)"
@@ -463,11 +639,17 @@ func apply(path: String, dryRun: Bool, launch: Bool) {
 		}
 
 		// Desktop placement first, since moving spaces can change the frame.
+		var deferMinimize = false
 		if let desktop = saved.desktop, let id = live.id,
 		   let target = desktopSpaceId(display: display.uuid, desktop: desktop),
 		   !spaceIds(for: id).contains(target) {
 			if let yabai = yabai, yabaiMove(yabai, windowId: id, toSpace: target) {
 				Thread.sleep(forTimeInterval: 0.2)
+			} else if moveDesktops, let targetDesktop = desktops.first(where: { $0.spaceId == target }) {
+				// Done after every window is placed, since it switches desktops on screen.
+				desktopMoves.append(DesktopMove(label: label, live: live, target: targetDesktop, frame: frame,
+				                                minimize: saved.minimized, where_: where_))
+				deferMinimize = true
 			} else {
 				let current = spaceIds(for: id).first.flatMap { spaces[$0]?.desktop }.map(String.init) ?? "?"
 				wrongDesktop.append("\(label) (on desktop \(current), saved on \(where_))")
@@ -480,16 +662,21 @@ func apply(path: String, dryRun: Bool, launch: Bool) {
 			axSetFrame(live.element, frame)
 			axSetBool(live.element, "AXFullScreen", true)
 		}
-		if saved.minimized { axSetBool(live.element, kAXMinimizedAttribute, true) }
+		if saved.minimized && !deferMinimize { axSetBool(live.element, kAXMinimizedAttribute, true) }
 
 		print("  placed    \(label) -> \(where_)")
 		moved += 1
 	}
 
+	if !desktopMoves.isEmpty {
+		print("Moving \(desktopMoves.count) window(s) to their desktops (the screen will switch desktops)...")
+		wrongDesktop += moveAcrossDesktops(desktopMoves)
+	}
+
 	print("\(dryRun ? "Dry run" : "Placed \(moved) window(s)"), \(skipped) missing")
 	if !wrongDesktop.isEmpty {
-		print("\nThese windows are on a different desktop than saved. macOS does not let other apps move windows")
-		print("between desktops; install yabai with its scripting addition to automate it, or drag them manually:")
+		print("\nThese windows are on a different desktop than saved. Use --move-desktops (needs the")
+		print("\"Switch to Desktop N\" shortcuts), install yabai with its scripting addition, or drag them manually:")
 		wrongDesktop.forEach { print("  \($0)") }
 	}
 }
@@ -505,10 +692,19 @@ case "check":
 case "save":
 	requireAccessibility(prompt: true)
 	save()
-case "apply":
-	guard args.count >= 2 else { fail("Usage: WindowLayoutHelper apply <file> [--dry-run] [--launch]") }
+case "desktops":
+	printDesktops()
+case "switch":
+	guard args.count >= 2, let n = Int(args[1]),
+	      let desktop = desktopList().desktops.first(where: { $0.globalNumber == n }) else { fail("Usage: WindowLayoutHelper switch <desktop number>") }
 	requireAccessibility(prompt: true)
-	apply(path: args[1], dryRun: args.contains("--dry-run"), launch: args.contains("--launch"))
+	if !switchTo(desktop, hotkeys: desktopHotkeys()) { fail("Desktop \(n) did not come up; check its shortcut in System Settings") }
+	print("Showing Desktop \(n)")
+case "apply":
+	guard args.count >= 2 else { fail("Usage: WindowLayoutHelper apply <file> [--dry-run] [--launch] [--move-desktops]") }
+	requireAccessibility(prompt: true)
+	apply(path: args[1], dryRun: args.contains("--dry-run"), launch: args.contains("--launch"),
+	      moveDesktops: args.contains("--move-desktops"))
 default:
-	fail("Usage: WindowLayoutHelper save | apply <file> [--dry-run] [--launch] | check")
+	fail("Usage: WindowLayoutHelper save | apply <file> [--dry-run] [--launch] [--move-desktops] | desktops | switch <n> | check")
 }

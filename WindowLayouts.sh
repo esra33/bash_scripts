@@ -88,19 +88,23 @@ function SaveWindowLayout() {
 	echo "Saved $(jq '.windows | length' "$file") windows on $(jq '.displays | length' "$file") display(s) to $file";
 }
 
-# Usage: LoadWindowLayout <name> [--dry-run] [--launch]
+# Usage: LoadWindowLayout <name> [--dry-run] [--launch] [--move-desktops]
 #   Moves and resizes windows to match a saved profile.
 #
 #   Options:
-#     --dry-run   Print where each window would go without moving anything
-#     --launch    Open apps from the profile that are not running, then place them
+#     --dry-run         Print where each window would go without moving anything
+#     --launch          Open apps from the profile that are not running, then place them
+#     --move-desktops   Move windows that are on the wrong desktop, switching desktops on
+#                       screen to do it. Needs the "Switch to Desktop N" shortcuts (see
+#                       ListDesktops), and a second display for moves within one display.
 #
-#   Windows on the wrong desktop are moved with yabai when it is installed with its
-#   scripting addition; otherwise they are listed so you can drag them over.
+#   Windows on the wrong desktop are moved with yabai when it is installed with its scripting
+#   addition, then with --move-desktops; any left over are listed so you can drag them over.
 #
 #   Examples:
 #     LoadWindowLayout work
-#     LoadWindowLayout work --launch
+#     LoadWindowLayout work --move-desktops
+#     LoadWindowLayout work --launch --move-desktops
 #     LoadWindowLayout work --dry-run
 function LoadWindowLayout() {
 	if IsHelpFlag "$1"; then WindowLayoutUsage "${FUNCNAME[0]}"; return 0; fi
@@ -157,6 +161,21 @@ function ShowWindowLayout() {
 		| "\n\($names[.[0].display] // "Unknown display") - " + (if .[0].desktop then "desktop \(.[0].desktop)" else "all desktops" end),
 		  (.[] | "  \(.app): \(if .title == "" then "(untitled)" else .title end)  [\(.relativeFrame.x|floor),\(.relativeFrame.y|floor) \(.relativeFrame.w|floor)x\(.relativeFrame.h|floor)]\(if .fullscreen then " fullscreen" else "" end)\(if .minimized then " minimized" else "" end)")
 	' "$file";
+}
+
+# Usage: ListDesktops
+#   Lists every desktop across your displays with the number "Switch to Desktop N" uses,
+#   whether that shortcut is turned on, and which desktops are showing.
+#   LoadWindowLayout --move-desktops needs the shortcut for every desktop it moves windows to,
+#   and for every desktop those windows start on.
+#
+#   Turn the shortcuts on in System Settings > Keyboard > Keyboard Shortcuts > Mission Control.
+#
+#   Example:
+#     ListDesktops
+function ListDesktops() {
+	if IsHelpFlag "$1"; then WindowLayoutUsage "${FUNCNAME[0]}"; return 0; fi
+	WindowLayoutHelper desktops;
 }
 
 # Usage: DeleteWindowLayout <name>
