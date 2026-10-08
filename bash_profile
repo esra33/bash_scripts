@@ -22,8 +22,7 @@ function RefreshScripts(){
      source "$BASH_SCRIPTS/LogCommits.sh"
      source "$BASH_SCRIPTS/AndroidUtilities.sh"
      source "$BASH_SCRIPTS/WindowLayouts.sh"
-}
-RefreshScripts
 
-AddToPath "$BASH_SCRIPTS"
-DedupePath
+     AddToPath "$BASH_SCRIPTS"
+     DedupePath
+}

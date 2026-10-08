@@ -93,7 +93,7 @@ function ARESHelp() {
 		*) mode="detail"; target=$1 ;;
 	esac
 
-	local sections=("Git|GitCommands.sh" "Commit history|LogCommits.sh" "Android|AndroidUtilities.sh" "Shell|Constants.sh");
+	local sections=("Git|GitCommands.sh" "Commit history|LogCommits.sh" "Android|AndroidUtilities.sh" "Window layouts|WindowLayouts.sh" "Shell|Constants.sh");
 
 	if [ "$mode" != "detail" ]; then
 		echo "";
