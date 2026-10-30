@@ -92,8 +92,41 @@ function ResetCommit(){
 #-------------------------------------------------------
 # Usage: PullBranch
 #   Pulls the current branch, keeping local changes.
+#   If local and remote have both moved on (diverged), merges the remote into local.
+#   Stops on conflicts; local changes come back once the merge is committed or aborted.
 function PullBranch(){
-     git pull --autostash;
+     if ! HasUpstream; then
+          LogError "$(GetCurrentBranch) is not tracking a remote branch";
+          return 1;
+     fi
+
+     git fetch || return 1;
+
+     local upstream outbound inbound;
+     upstream=$(git rev-parse --abbrev-ref '@{u}');
+     read -r outbound inbound < <(git rev-list --left-right --count 'HEAD...@{u}');
+
+     if [ "$inbound" -eq 0 ]; then
+          echo "Already up to date with $upstream ($outbound outbound)";
+          return 0;
+     fi
+
+     if [ "$outbound" -eq 0 ]; then
+          echo "Fast-forwarding $inbound inbound commit(s) from $upstream";
+          git merge --ff-only --autostash '@{u}';
+          return;
+     fi
+
+     LogMessage "Diverged from $upstream ($outbound outbound, $inbound inbound), merging it into local";
+     if ! git merge --no-edit --autostash '@{u}'; then
+          local hasConflicts;
+          hasConflicts=$(HasConflicts);
+          if [ -n "$hasConflicts" ]; then
+               LogError "Merge conflicts in:"$'\n'"$hasConflicts";
+               echo "Resolve them and commit, or run 'git merge --abort'. Your local changes are re-applied after either";
+          fi
+          return 1;
+     fi
 }
 
 #-------------------------------------------------------
@@ -109,6 +142,118 @@ function PushBranch(){
      branch=$(GetCurrentBranch);
      echo "Pushing to origin $branch";
      git push -u origin HEAD && echo "Push Completed";
+}
+
+#-------------------------------------------------------
+# Usage: CommitAndPush -m <message> [-t <file types>] [-s <change types>] [--dry-run]
+#   Commits the changed files that match the filters, then pushes (see PushBranch).
+#   Only the matching files are committed, anything else stays as it is.
+#   -m, --message   Commit message (required)
+#   -t, --types     File extensions separated by commas (default all)
+#                   Unity .meta files are included with the files they belong to
+#   -s, --status    Change types separated by commas: Added, Modified, Removed, Renamed (default all)
+#                   New untracked files count as Added
+#   --dry-run       Only show the files that would be committed
+#   Example: CommitAndPush -m "Updated enemies" -t "cs,prefab,asset" -s "Added,Modified"
+function CommitAndPush(){
+     local message="" types="" statuses="" dryRun=false;
+     while [ $# -gt 0 ]; do
+          case "$1" in
+               -m|--message) message=$2; shift ;;
+               -t|--types) types=$2; shift ;;
+               -s|--status) statuses=$2; shift ;;
+               --dry-run) dryRun=true ;;
+               *) LogError "Unknown option: $1"; return 1 ;;
+          esac
+          shift;
+     done
+
+     if [ -z "$message" ]; then
+          LogError "Usage: CommitAndPush -m <message> [-t <file types>] [-s <change types>] [--dry-run]";
+          return 1;
+     fi
+     if [ -z "$(GetCurrentBranch 2>/dev/null)" ]; then
+          LogError "Not on a branch (or not in a git repo)";
+          return 1;
+     fi
+     if [ -n "$(HasConflicts)" ]; then
+          LogError "Resolve the merge conflicts first";
+          return 1;
+     fi
+
+     # Normalized as ",a,b,": lowercase, no spaces or leading dots
+     types=$(echo "$types" | tr '[:upper:]' '[:lower:]' | tr -d ' .*');
+     statuses=$(echo "$statuses" | tr '[:upper:]' '[:lower:]' | tr -d ' ' | sed 's/deleted/removed/g');
+     local status;
+     for status in $(echo "$statuses" | tr ',' ' '); do
+          case "$status" in
+               added|modified|removed|renamed) ;;
+               *) LogError "Unknown change type: $status (use Added, Modified, Removed, Renamed)"; return 1 ;;
+          esac
+     done
+     [ -n "$types" ] && types=",$types,";
+     [ -n "$statuses" ] && statuses=",$statuses,";
+
+     local root;
+     root=$(git rev-parse --show-toplevel);
+
+     local entry xy path oldPath change file extension matches=() paths=() addPaths=();
+     while IFS= read -r -d '' entry; do
+          xy=${entry:0:2};
+          path=${entry:3};
+          oldPath="";
+          if [[ "$xy" == *R* ]] || [[ "$xy" == *C* ]]; then
+               IFS= read -r -d '' oldPath;
+          fi
+
+          case "$xy" in
+               '??') change="added" ;;
+               AD) continue ;; # Added then deleted, nothing to commit
+               *D*) change="removed" ;;
+               *R*) change="renamed" ;;
+               *A*|*C*) change="added" ;;
+               *) change="modified" ;;
+          esac
+          if [ -n "$statuses" ] && [[ "$statuses" != *",$change,"* ]]; then
+               continue;
+          fi
+
+          if [ -n "$types" ]; then
+               # foo.cs.meta is judged by foo.cs
+               file=$(basename "${path%.meta}");
+               extension="";
+               [[ "$file" == *.* ]] && extension=$(echo "${file##*.}" | tr '[:upper:]' '[:lower:]');
+               if [[ "$types" != *",$extension,"* ]] && [[ "$types" != *",meta,"* || "$path" != *.meta ]]; then
+                    continue;
+               fi
+          fi
+
+          matches+=("$xy $path${oldPath:+ (from $oldPath)}");
+          paths+=("$path");
+          [ -n "$oldPath" ] && paths+=("$oldPath");
+          # Fully staged changes don't need adding (and a staged delete/rename source can't be added)
+          [ "${xy:1:1}" != " " ] && addPaths+=("$path");
+     done < <(git -C "$root" status --porcelain -z --untracked-files=all);
+
+     if [ ${#matches[@]} -eq 0 ]; then
+          echo "No changes match the filters, nothing to commit";
+          return 0;
+     fi
+
+     LogMessage "Committing ${#matches[@]} file(s)";
+     printf '%s\n' "${matches[@]}";
+
+     if [ "$dryRun" == true ]; then
+          return 0;
+     fi
+
+     # Paths are taken literally so names with * or [ ] are not treated as patterns
+     if [ ${#addPaths[@]} -gt 0 ]; then
+          printf '%s\0' "${addPaths[@]}" | GIT_LITERAL_PATHSPECS=1 git -C "$root" add -A --pathspec-from-file=- --pathspec-file-nul || return 1;
+     fi
+     printf '%s\0' "${paths[@]}" | GIT_LITERAL_PATHSPECS=1 git -C "$root" commit -m "$message" --pathspec-from-file=- --pathspec-file-nul || return 1;
+
+     PushBranch;
 }
 
 #------------------------------------------------------------------
