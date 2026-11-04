@@ -26,3 +26,11 @@ function RefreshScripts(){
      AddToPath "$BASH_SCRIPTS"
      DedupePath
 }
+
+# >>> Codex installer >>>
+export PATH="/Users/aramirez/.local/bin:$PATH"
+# <<< Codex installer <<<
+
+# Unity CLI
+. "/Users/aramirez/.unity/env"
+. "/Users/aramirez/Library/Application Support/BoostSecurity/state/endpoint-safepkg/shell/safepkg.sh" # # managed by BoostSecurity safepkg - do not edit; run 'safepkg ctl uninstrument' to remove
