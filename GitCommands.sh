@@ -696,3 +696,80 @@ function MigrateRepo(){
      echo -e "${BLUE_COLOR}Migration Completed. The old remote is still available as old-origin${NO_COLOR}";
      Say "Job's Done!";
 }
+
+#-------------------------------------------------------
+# Usage: LandWorktree <branch>
+#   Lands the worktree for <branch> into the current branch: merges it (--no-ff), pushes,
+#   removes the worktree, then deletes <branch> locally and from origin (if it exists there).
+#   Stops without cleaning up on a dirty worktree, merge conflicts, or a worktree git refuses
+#   to remove (uncommitted/untracked files).
+#   Example: LandWorktree agent/some-feature
+function LandWorktree(){
+     if [ -z "$1" ]; then
+          LogError "Usage: LandWorktree <branch>";
+          return 1;
+     fi
+     local branch="$1";
+
+     local target;
+     target=$(GetCurrentBranch 2>/dev/null);
+     if [ -z "$target" ]; then
+          LogError "Not on a branch (or not in a git repo)";
+          return 1;
+     fi
+     if [ "$target" == "$branch" ]; then
+          LogError "Already on $branch, nothing to land it into";
+          return 1;
+     fi
+     if ! IsBranchClean; then
+          LogError "Commit or stash your changes on $target first";
+          return 1;
+     fi
+
+     local worktreePath="" path;
+     while IFS= read -r line; do
+          case "$line" in
+               "worktree "*) path=${line#worktree } ;;
+               "branch refs/heads/$branch") worktreePath="$path" ;;
+          esac
+     done < <(git worktree list --porcelain);
+
+     if [ -z "$worktreePath" ]; then
+          LogError "No worktree found for branch $branch";
+          return 1;
+     fi
+     if [ -n "$(git -C "$worktreePath" status --porcelain)" ]; then
+          LogError "Worktree for $branch has uncommitted changes:";
+          git -C "$worktreePath" status --short;
+          return 1;
+     fi
+
+     LogMessage "Merging $branch into $target";
+     if ! git merge --no-ff "$branch" -m "Merge branch '$branch' into $target"; then
+          local hasConflicts;
+          hasConflicts=$(HasConflicts);
+          if [ -n "$hasConflicts" ]; then
+               LogError "Merge conflicts in:"$'\n'"$hasConflicts";
+               echo "Resolve them and commit, or run 'git merge --abort'";
+          fi
+          return 1;
+     fi
+
+     PushBranch || return 1;
+
+     LogMessage "Removing worktree $worktreePath";
+     if ! git worktree remove "$worktreePath"; then
+          LogError "Could not remove worktree $worktreePath (see above). Resolve it manually, then re-run to delete the branches, or delete them yourself.";
+          return 1;
+     fi
+     git worktree prune;
+
+     git branch -d "$branch" || LogError "Could not delete local branch $branch";
+
+     if git ls-remote --exit-code --heads origin "$branch" > /dev/null 2>&1; then
+          LogMessage "Deleting remote branch $branch";
+          git push origin --delete "$branch" || LogError "Could not delete remote branch $branch";
+     fi
+
+     echo -e "${BLUE_COLOR}Landed $branch into $target${NO_COLOR}";
+}
