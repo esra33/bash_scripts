@@ -698,18 +698,24 @@ function MigrateRepo(){
 }
 
 #-------------------------------------------------------
-# Usage: LandWorktree <branch>
+# Usage: LandWorktree <branch> [-f]
 #   Lands the worktree for <branch> into the current branch: merges it (--no-ff), pushes,
 #   removes the worktree, then deletes <branch> locally and from origin (if it exists there).
-#   Stops without cleaning up on a dirty worktree, merge conflicts, or a worktree git refuses
-#   to remove (uncommitted/untracked files).
+#   Stops without cleaning up on merge conflicts, or a worktree git refuses to remove
+#   (uncommitted/untracked files). Stops on a dirty target branch unless -f is set.
+#   -f              Force landing: skip dirty branch and worktree change checks
 #   Example: LandWorktree agent/some-feature
+#   Example: LandWorktree agent/some-feature -f
 function LandWorktree(){
      if [ -z "$1" ]; then
-          LogError "Usage: LandWorktree <branch>";
+          LogError "Usage: LandWorktree <branch> [-f]";
           return 1;
      fi
      local branch="$1";
+     local force=false;
+     if [ "$2" == "-f" ]; then
+          force=true;
+     fi
 
      local target;
      target=$(GetCurrentBranch 2>/dev/null);
@@ -721,7 +727,7 @@ function LandWorktree(){
           LogError "Already on $branch, nothing to land it into";
           return 1;
      fi
-     if ! IsBranchClean; then
+     if [ "$force" == false ] && ! IsBranchClean; then
           LogError "Commit or stash your changes on $target first";
           return 1;
      fi
@@ -738,7 +744,7 @@ function LandWorktree(){
           LogError "No worktree found for branch $branch";
           return 1;
      fi
-     if [ -n "$(git -C "$worktreePath" status --porcelain)" ]; then
+     if [ "$force" == false ] && [ -n "$(git -C "$worktreePath" status --porcelain)" ]; then
           LogError "Worktree for $branch has uncommitted changes:";
           git -C "$worktreePath" status --short;
           return 1;
@@ -758,7 +764,12 @@ function LandWorktree(){
      PushBranch || return 1;
 
      LogMessage "Removing worktree $worktreePath";
-     if ! git worktree remove "$worktreePath"; then
+     local removeFlags="";
+     if [ "$force" == true ]; then
+          removeFlags="-f -f";
+     fi
+
+     if ! git worktree remove $removeFlags "$worktreePath"; then
           LogError "Could not remove worktree $worktreePath (see above). Resolve it manually, then re-run to delete the branches, or delete them yourself.";
           return 1;
      fi
